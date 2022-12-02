@@ -95,14 +95,24 @@ class Window:
     # read config file.
     CFG = yaml.safe_load(open("config/semantic-kitti.yaml", 'r'))
     color_dict = CFG["color_map"]
-    self.label_colors = glow.GlTextureRectangle(1024, 1, internalFormat=GL_RGB, format=GL_RGB)
+    self.label_colors = glow.GlTextureRectangle(2048, 1, internalFormat=GL_RGB, format=GL_RGB)
 
-    cols = np.zeros((1024 * 3), dtype=np.uint8)
+    np.random.seed(1024)
+    inst_color_lut = np.random.uniform(low=0.0,
+                                        high=1.0,
+                                        size=(2048, 3))
+
+    cols = (inst_color_lut.flatten()*255).astype(np.uint8)
     for label_id, color in color_dict.items():
       cols[3 * label_id + 0] = color[2]
       cols[3 * label_id + 1] = color[1]
       cols[3 * label_id + 2] = color[0]
 
+    map_inv = CFG["learning_map_inv"]
+    self.map_inv = np.zeros(max(map_inv.keys()) + 1, dtype=np.uint32)
+    for k, v in map_inv.items():
+      self.map_inv[k] = v
+    
     self.label_colors.assign(cols)
 
     self.initializeGL()
@@ -243,7 +253,7 @@ class Window:
 
   def open_directory(self, directory):
     """ open given sequences directory and get filenames of relevant files. """
-    self.subdirs = [subdir for subdir in ["voxels", "predictions"] if os.path.exists(os.path.join(directory, subdir))]
+    self.subdirs = [subdir for subdir in ["voxels", "predictions", "gt_PAN"] if os.path.exists(os.path.join(directory, subdir))]
 
     if len(self.subdirs) == 0: raise RuntimeError("Neither 'voxels' nor 'predictions' found in " + directory)
 
@@ -260,6 +270,12 @@ class Window:
       if len(data) > 0:
         self.availableData[subdir].append("input")
         self.data[subdir]["input"] = data
+        self.num_scans = len(data)
+
+      data = sorted([os.path.join(complete_path, f) for f in files if f.endswith(".npy")])
+      if len(data) > 0:
+        self.availableData[subdir].append("pan")
+        self.data[subdir]["pan"] = data
         self.num_scans = len(data)
 
       data = sorted([os.path.join(complete_path, f) for f in files if f.endswith(".label")])
@@ -279,7 +295,7 @@ class Window:
         self.availableData[subdir].append("occluded")
         self.data[subdir]["occluded"] = data
         self.num_scans = len(data)
-
+    
     self.current_subdir = 0
     self.current_data = self.availableData[self.subdirs[self.current_subdir]][0]
 
@@ -293,6 +309,7 @@ class Window:
 
     # todo: modify based on available stuff.
     self.showLabels = (self.current_data == "labels")
+    self.showPan = (self.current_data == "pan")
     self.showInput = (self.current_data == "input")
     self.showInvalid = (self.current_data == "invalid")
     self.showOccluded = (self.current_data == "occludded")
@@ -300,11 +317,17 @@ class Window:
   def setCurrentBufferData(self, data_name, t):
     # update buffer content with given data identified by data_name.
     subdir = self.subdirs[self.current_subdir]
-
     if len(self.data[subdir][data_name]) < t: return False
 
     # Note: uint with np.uint32 did not work as expected! (with instances and uint32 this causes problems!)
-    if data_name == "labels":
+    if data_name == "pan":
+      buffer_data = np.load(self.data[subdir][data_name][t])
+      buffer_data_inst = buffer_data%1000
+      buffer_data = buffer_data//1000
+      buffer_data = self.map_inv[buffer_data].astype(np.float32)
+      mask = np.where(buffer_data_inst != 0)
+      buffer_data[mask] = (buffer_data[mask]*1000 + buffer_data_inst[mask]) % 1024 + 1024
+    elif data_name == "labels":
       buffer_data = np.fromfile(self.data[subdir][data_name][t], dtype=np.uint16).astype(np.float32)
     else:
       buffer_data = unpack(np.fromfile(self.data[subdir][data_name][t], dtype=np.uint8)).astype(np.float32)
@@ -315,7 +338,7 @@ class Window:
 
   def on_resize(self, window, w, h):
     # set projection matrix
-    fov = math.radians(45.0)
+    fov = math.radians(45.0)  
     aspect = w / h
 
     self.projection_ = glPerspective(fov, aspect, 0.1, 2000.0)
@@ -455,7 +478,13 @@ class Window:
         for i, subdir in enumerate(self.subdirs):
           changed, value = imgui.checkbox(subdir, self.current_subdir == i)
           if i < len(self.subdirs) - 1: imgui.same_line()
-          if changed and value: self.current_subdir = i
+          if changed and value:
+            self.showInput = False
+            self.showLabels = False
+            self.showPan = False
+            self.showInvalid = False
+            self.showOccluded = False
+            self.current_subdir = i
 
       subdir = self.subdirs[self.current_subdir]
 
@@ -469,6 +498,7 @@ class Window:
       if changed and value and data_available:
         self.showInput = True
         self.showLabels = False
+        self.showPan = False
 
       imgui.pop_style_var()
 
@@ -481,7 +511,22 @@ class Window:
       changed, value = imgui.checkbox("labels", self.showLabels)
       if changed and value and data_available:
         self.showInput = False
+        self.showPan = False
         self.showLabels = True
+      
+      imgui.pop_style_var()
+      
+      data_available = "pan" in self.availableData[subdir]
+      if data_available:
+        imgui.push_style_var(imgui.STYLE_ALPHA, 1.0)
+      else:
+        imgui.push_style_var(imgui.STYLE_ALPHA, 0.3)
+      
+      changed, value = imgui.checkbox("pan", self.showPan)
+      if changed and value and data_available:
+        self.showInput = False
+        self.showLabels = False
+        self.showPan = True
 
       imgui.pop_style_var()
 
@@ -535,6 +580,10 @@ class Window:
 
       if self.showLabels:
         self.setCurrentBufferData("labels", self.currentTimestep)
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 36, self.num_instances)
+      
+      if self.showPan:
+        self.setCurrentBufferData("pan", self.currentTimestep)
         glDrawArraysInstanced(GL_TRIANGLES, 0, 36, self.num_instances)
 
       self.program["use_label_colors"] = False
